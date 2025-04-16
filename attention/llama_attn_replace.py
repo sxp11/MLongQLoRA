@@ -231,6 +231,8 @@ def forward_noflashattn(
     output_attentions: bool = False,
     use_cache: bool = False,
     padding_mask: Optional[torch.LongTensor] = None,
+    use_memorys:bool = False,
+    update_memorys: bool = False,
     memorys: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
     bsz, q_len, _ = hidden_states.size()
@@ -266,79 +268,276 @@ def forward_noflashattn(
     query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
     key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
     value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+    if use_memorys:
+        mem_len = memorys.shape[1]
 
-    kv_seq_len = key_states.shape[-2]
-    if past_key_value is not None:
-        kv_seq_len += past_key_value[0].shape[-2]
-    cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+        if(mem_len != group_size // 2):
+            raise ValueError("memorys lens %d should be equal to group size//2 %d."%(mem_len, group_size // 2))
+        
+        mem_key_states = self.k_proj(memorys)
+        mem_value_states = self.v_proj(memorys)
+        mem_key_states = mem_key_states.view(bsz, mem_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        mem_value_states = mem_value_states.view(bsz, mem_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
-    if past_key_value is not None:
-        # reuse k, v, self_attention
-        key_states = torch.cat([past_key_value[0], key_states], dim=2)
-        value_states = torch.cat([past_key_value[1], value_states], dim=2)
+        kv_seq_len = key_states.shape[-2]
+        if past_key_value is not None:
+            kv_seq_len += past_key_value[0].shape[-2]
+        mem_kv_seq_len = kv_seq_len + mem_len
 
-    past_key_value = (key_states, value_states) if use_cache else None
+        position_ids = position_ids + mem_len
+        mem_position_ids = torch.arange(mem_len, device=position_ids.device).unsqueeze(0).expand(bsz, mem_len)
 
-    # repeat k/v heads if n_kv_heads < n_heads
-    key_states = repeat_kv(key_states, self.num_key_value_groups)
-    value_states = repeat_kv(value_states, self.num_key_value_groups)
+        def apply_rotary_pos_emb_only_key(k, cos, sin, position_ids):
+            # The first two dimensions of cos and sin are always 1, so we can `squeeze` them.
+            cos = cos.squeeze(1).squeeze(0)  # [seq_len, dim]
+            sin = sin.squeeze(1).squeeze(0)  # [seq_len, dim]
+            cos = cos[position_ids].unsqueeze(1)  # [bs, 1, seq_len, dim]
+            sin = sin[position_ids].unsqueeze(1)  # [bs, 1, seq_len, dim]
+            k_embed = (k * cos) + (rotate_half(k) * sin)
+            return k_embed
+        # 这里对于前半部分的query和key进行ROPE的时候要不要留出mem的位置，就是不从0开始。我觉得先留吧，毕竟在推理时是都可以看到mem。
+        cos, sin = self.rotary_emb(value_states, seq_len=mem_kv_seq_len)
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+        mem_key_states = apply_rotary_pos_emb_only_key(mem_key_states, cos, sin, mem_position_ids)
+        
+        if past_key_value is not None:
+            # reuse k, v, self_attention
+            key_states = torch.cat([past_key_value[0], key_states], dim=2)
+            value_states = torch.cat([past_key_value[1], value_states], dim=2)
 
-    # shift
-    def shift(qkv, bsz, q_len, group_size, num_heads, head_dim):
-        qkv[:, num_heads // 2:] = qkv[:, num_heads // 2:].roll(-group_size // 2, dims=2)
-        qkv = qkv.transpose(1, 2).reshape(bsz * (q_len // group_size), group_size, num_heads, head_dim).transpose(1, 2)
-        return qkv
+        past_key_value = (key_states, value_states) if use_cache else None
+        
+        key_states = repeat_kv(key_states, self.num_key_value_groups)
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
+        mem_key_states = repeat_kv(mem_key_states, self.num_key_value_groups)
+        mem_value_states = repeat_kv(mem_value_states, self.num_key_value_groups)
 
-    query_states = shift(query_states, bsz, q_len, group_size, self.num_heads, self.head_dim)
-    key_states = shift(key_states, bsz, q_len, group_size, self.num_heads, self.head_dim)
-    value_states = shift(value_states, bsz, q_len, group_size, self.num_heads, self.head_dim)
+        mem_key_states = mem_key_states[:,self.num_key_value_heads//2:]
+        mem_value_states = mem_value_states[:,self.num_key_value_heads//2:]
 
-    attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+        # def group(qkv, bsz, q_len, group_size, num_heads, head_dim):
+        #     qkv = qkv.transpose(1, 2).reshape(bsz * (q_len // group_size), group_size, num_heads, head_dim).transpose(1, 2)
+        #     return qkv
+        
+        first_half_query_states = query_states[:, :self.num_heads//2].transpose(1, 2).reshape(bsz * (q_len // group_size), group_size, self.num_heads, self.head_dim).transpose(1, 2)
+        second_half_query_states = query_states[:, self.num_heads//2:]
+        first_half_key_states = key_states[:, :self.num_key_value_heads//2].transpose(1, 2).reshape(bsz * (q_len // group_size), group_size, self.num_heads, self.head_dim).transpose(1, 2)
+        second_half_key_states = key_states[:, self.num_key_value_heads//2:]
+        first_half_value_states = value_states[:, :self.num_key_value_heads//2].transpose(1, 2).reshape(bsz * (q_len // group_size), group_size, self.num_heads, self.head_dim).transpose(1, 2)
+        second_half_value_states = value_states[:, self.num_key_value_heads//2:]
 
-    if attn_weights.size() != (bsz * num_group, self.num_heads, group_size, group_size):
-        raise ValueError(
-            f"Attention weights should be of size {(bsz * num_group, self.num_heads, group_size, group_size)}, but is"
-            f" {attn_weights.size()}"
-        )
+        # first_half_query_states = group(first_half_query_states, bsz, q_len, group_size, self.num_heads, self.head_dim)
+        # first_half_key_states = group(first_half_key_states, bsz, q_len, group_size, self.num_heads, self.head_dim)
+        # first_half_value_states = group(first_half_value_states, bsz, q_len, group_size, self.num_heads, self.head_dim)
 
-    attention_mask = attention_mask[:, :, :group_size, :group_size].repeat(num_group, 1, 1, 1)
-    if attention_mask is not None:
-        if attention_mask.size() != (bsz * num_group, 1, group_size, group_size):
+        # second_half_query_states_normal = second_half_query_states.roll(-group_size//2, dims=2)[:,:,:-group_size].transpose(1, 2).reshape(bsz * ((q_len // group_size) - 1), group_size, self.num_heads, self.head_dim).transpose(1, 2)
+        # second_half_key_states_normal = second_half_key_states.roll(-group_size//2, dims=2)[:,:,:-group_size].transpose(1, 2).reshape(bsz * ((q_len // group_size) - 1), group_size, self.num_heads, self.head_dim).transpose(1, 2)
+        # second_half_value_states_normal = second_half_value_states.roll(-group_size//2, dims=2)[:,:,:-group_size].transpose(1, 2).reshape(bsz * ((q_len // group_size) - 1), group_size, self.num_heads, self.head_dim).transpose(1, 2)
+
+        second_half_query_states_normal = second_half_query_states[:, :, group_size//2:-group_size//2].transpose(1, 2).reshape(bsz * ((q_len // group_size) - 1), group_size, self.num_heads, self.head_dim).transpose(1, 2)
+        second_half_key_states_normal = second_half_key_states[:, :, group_size//2:-group_size//2].transpose(1, 2).reshape(bsz * ((q_len // group_size) - 1), group_size, self.num_heads, self.head_dim).transpose(1, 2)
+        second_half_value_states_normal = second_half_value_states[:, :, group_size//2:-group_size//2].transpose(1, 2).reshape(bsz * ((q_len // group_size) - 1), group_size, self.num_heads, self.head_dim).transpose(1, 2)
+
+        # second_half_query_states_mem = second_half_query_states.roll(-group_size//2, dims=2)[:,:,-group_size//2:]
+        # second_half_query_states_end = second_half_query_states.roll(-group_size//2, dims=2)[:,:,-group_size:-group_size//2]
+        # second_half_key_states_mem = second_half_key_states.roll(-group_size//2, dims=2)[:,:,-group_size//2:]
+        # second_half_key_states_end = second_half_key_states.roll(-group_size//2, dims=2)[:,:,-group_size:-group_size//2]
+        # second_half_value_states_mem = second_half_value_states.roll(-group_size//2, dims=2)[:,:,-group_size//2:]
+        # second_half_value_states_end = second_half_value_states.roll(-group_size//2, dims=2)[:,:,-group_size:-group_size//2]
+
+        second_half_query_states_mem = second_half_query_states[:, : , :group_size//2]
+        second_half_query_states_end = second_half_query_states[:, :, -group_size//2:]
+        second_half_key_states_mem = second_half_key_states[:, :, :group_size//2]
+        second_half_key_states_end = second_half_key_states[:, :, -group_size//2:]
+        second_half_value_states_mem = second_half_value_states[:, :, :group_size//2]
+        second_half_value_states_end = second_half_value_states[:, :, -group_size//2:]
+
+        second_half_key_states_mem = torch.cat((mem_key_states, second_half_key_states_mem), dim=2)
+        second_half_value_states_mem = torch.cat((mem_value_states, second_half_value_states_mem), dim=2)
+
+        first_half_attn_weights = torch.matmul(first_half_query_states, first_half_key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+        if first_half_attn_weights.size() != (bsz * num_group, self.num_heads//2, group_size, group_size):
             raise ValueError(
-                f"Attention mask should be of size {(bsz * num_group, 1, group_size, group_size)}, but is {attention_mask.size()}"
+                f"Attention weights should be of size {(bsz * num_group, self.num_heads//2, group_size, group_size)}, but is"
+                f" {first_half_attn_weights.size()}"
             )
-        attn_weights = attn_weights + attention_mask
+        
+        first_half_attn_mask = attention_mask[:, :, :group_size, :group_size].repeat(num_group, 1, 1, 1)
+        if first_half_attn_mask is not None:
+            if first_half_attn_mask.size() != (bsz * num_group, 1, group_size, group_size):
+                raise ValueError(
+                    f"Attention mask should be of size {(bsz * num_group, 1, group_size, group_size)}, but is {first_half_attn_mask.size()}"
+                )
 
-    # upcast attention to fp32
-    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-    attn_output = torch.matmul(attn_weights, value_states)
+        second_half_attn_weights_normal = torch.matmul(second_half_query_states_normal, second_half_key_states_normal.transpose(2, 3)) / math.sqrt(self.head_dim)
+        if second_half_attn_weights_normal.size() != (bsz * (num_group - 1), self.num_heads//2, group_size, group_size):
+            raise ValueError(
+                f"Attention weights should be of size {(bsz * (num_group - 1), self.num_heads//2, group_size, group_size)}, but is"
+                f" {second_half_attn_weights_normal.size()}"
+            )
+        
+        second_half_attn_mask_normal = attention_mask[:, :, :group_size, :group_size].repeat(num_group - 1, 1, 1, 1)
+        if second_half_attn_mask_normal is not None:
+            if second_half_attn_mask_normal.size() != (bsz * (num_group - 1), 1, group_size, group_size):
+                raise ValueError(
+                    f"Attention mask should be of size {(bsz * (num_group - 1), 1, group_size, group_size)}, but is {second_half_attn_mask_normal.size()}"
+                )
+            
+        second_half_attn_weights_mem = torch.matmul(second_half_query_states_mem, second_half_key_states_mem.transpose(2, 3)) / math.sqrt(self.head_dim)
+        if second_half_attn_weights_mem.size() != (bsz , self.num_heads//2, group_size//2, group_size):
+            raise ValueError(
+                f"Attention weights should be of size {(bsz , self.num_heads//2, group_size//2, group_size)}, but is"
+                f" {second_half_attn_weights_mem.size()}"
+            )
+        
+        second_half_attn_mask_mem = torch.cat((torch.zeros(bsz, 1, group_size//2, group_size//2, device=attention_mask.device, dtype=attention_mask.dtype), attention_mask[:, :, :group_size//2, :group_size//2]), dim=3)
+        if second_half_attn_mask_mem is not None:
+            if second_half_attn_mask_mem.size() != (bsz , 1, group_size//2, group_size):
+                raise ValueError(
+                    f"Attention mask should be of size {(bsz , 1, group_size//2, group_size)}, but is {second_half_attn_mask_mem.size()}"
+                )
+            
+        second_half_attn_weights_end = torch.matmul(second_half_query_states_end, second_half_key_states_end.transpose(2, 3)) / math.sqrt(self.head_dim)
+        if second_half_attn_weights_end.size() != (bsz , self.num_heads//2, group_size//2, group_size//2):
+            raise ValueError(
+                f"Attention weights should be of size {(bsz , self.num_heads//2, group_size//2, group_size//2)}, but is"
+                f" {second_half_attn_weights_end.size()}"
+            )
+        
+        second_half_attn_mask_end = attention_mask[:, :, :group_size//2, :group_size//2]
+        if second_half_attn_mask_end is not None:
+            if second_half_attn_mask_end.size() != (bsz , 1, group_size//2, group_size//2):
+                raise ValueError(
+                    f"Attention mask should be of size {(bsz , 1, group_size//2, group_size//2)}, but is {second_half_attn_mask_end.size()}"
+                )
+            
+        first_half_attn_weights = first_half_attn_weights + first_half_attn_mask
+        second_half_attn_weights_normal = second_half_attn_weights_normal + second_half_attn_mask_normal
+        second_half_attn_weights_mem = second_half_attn_weights_mem + second_half_attn_mask_mem
+        second_half_attn_weights_end = second_half_attn_weights_end + second_half_attn_mask_end
 
-    if attn_output.size() != (bsz * num_group, self.num_heads, group_size, self.head_dim):
-        raise ValueError(
-            f"`attn_output` should be of size {(bsz * num_group, self.num_heads, group_size, self.head_dim)}, but is"
-            f" {attn_output.size()}"
-        )
-    attn_output = attn_output.transpose(1, 2).contiguous()
+        first_half_attn_weights = nn.functional.softmax(first_half_attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        first_half_attn_output = torch.matmul(first_half_attn_weights, first_half_value_states)
+        if first_half_attn_output.size() != (bsz * num_group, self.num_heads//2, group_size, self.head_dim):
+            raise ValueError(
+                f"`attn_output` should be of size {(bsz * num_group, self.num_heads//2, group_size, self.head_dim)}, but is"
+                f" {first_half_attn_output.size()}"
+            )
+        
+        second_half_attn_weights_normal = nn.functional.softmax(second_half_attn_weights_normal, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        second_half_attn_normal_output = torch.matmul(second_half_attn_weights_normal, second_half_value_states_normal)
+        if second_half_attn_normal_output.size() != (bsz * (num_group - 1), self.num_heads//2, group_size, self.head_dim):
+            raise ValueError(
+                f"`attn_output` should be of size {(bsz * (num_group - 1), self.num_heads//2, group_size, self.head_dim)}, but is"
+                f" {second_half_attn_normal_output.size()}"
+            )
+        
+        second_half_attn_weights_mem = nn.functional.softmax(second_half_attn_weights_mem, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        second_half_attn_mem_output = torch.matmul(second_half_attn_weights_mem, second_half_value_states_mem)
+        if second_half_attn_mem_output.size() != (bsz , self.num_heads//2, group_size//2, self.head_dim):
+            raise ValueError(
+                f"`attn_output` should be of size {(bsz , self.num_heads//2, group_size//2, self.head_dim)}, but is"
+                f" {second_half_attn_mem_output.size()}"
+            )
+        
+        second_half_attn_weights_end = nn.functional.softmax(second_half_attn_weights_end, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        second_half_attn_end_output = torch.matmul(second_half_attn_weights_end, second_half_value_states_end)
+        if second_half_attn_end_output.size() != (bsz , self.num_heads//2, group_size//2, self.head_dim):
+            raise ValueError(
+                f"`attn_output` should be of size {(bsz , self.num_heads//2, group_size//2, self.head_dim)}, but is"
+                f" {second_half_attn_end_output.size()}"
+            )
+        second_half_attn_normal_output = second_half_attn_normal_output.transpose(1, 2).reshape(bsz, q_len - group_size, self.num_heads//2, self.head_dim)
+        second_half_attn_output = torch.cat((second_half_attn_mem_output.transpose(1, 2), second_half_attn_normal_output, second_half_attn_end_output.transpose(1, 2)), dim=1)
+        first_half_attn_output = first_half_attn_output.transpose(1, 2).reshape(bsz, group_size, self.num_heads//2, self.head_dim)
+        attn_output = torch.cat((first_half_attn_output, second_half_attn_output), dim=2)
+        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
 
-    attn_output = attn_output.reshape(bsz, q_len, self.num_heads, self.head_dim)
+        if self.config.pretraining_tp > 1:
+            attn_output = attn_output.split(self.hidden_size // self.config.pretraining_tp, dim=2)
+            o_proj_slices = self.o_proj.weight.split(self.hidden_size // self.config.pretraining_tp, dim=1)
+            attn_output = sum([F.linear(attn_output[i], o_proj_slices[i]) for i in range(self.config.pretraining_tp)])
+        else:
+            attn_output = self.o_proj(attn_output)
 
-    # shift back
-    attn_output[:, :, self.num_heads//2:] = attn_output[:, :, self.num_heads//2:].roll(group_size//2, dims=1)
+        if not output_attentions:
+            attn_weights = None
 
-    attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
-
-    if self.config.pretraining_tp > 1:
-        attn_output = attn_output.split(self.hidden_size // self.config.pretraining_tp, dim=2)
-        o_proj_slices = self.o_proj.weight.split(self.hidden_size // self.config.pretraining_tp, dim=1)
-        attn_output = sum([F.linear(attn_output[i], o_proj_slices[i]) for i in range(self.config.pretraining_tp)])
+        return attn_output, attn_weights, past_key_value            
+        
     else:
-        attn_output = self.o_proj(attn_output)
+        kv_seq_len = key_states.shape[-2]
+        if past_key_value is not None:
+            kv_seq_len += past_key_value[0].shape[-2]
+        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
-    if not output_attentions:
-        attn_weights = None
+        if past_key_value is not None:
+            # reuse k, v, self_attention
+            key_states = torch.cat([past_key_value[0], key_states], dim=2)
+            value_states = torch.cat([past_key_value[1], value_states], dim=2)
 
-    return attn_output, attn_weights, past_key_value
+        past_key_value = (key_states, value_states) if use_cache else None
+
+        # repeat k/v heads if n_kv_heads < n_heads
+        key_states = repeat_kv(key_states, self.num_key_value_groups)
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+        # shift
+        def shift(qkv, bsz, q_len, group_size, num_heads, head_dim):
+            qkv[:, num_heads // 2:] = qkv[:, num_heads // 2:].roll(-group_size // 2, dims=2)
+            qkv = qkv.transpose(1, 2).reshape(bsz * (q_len // group_size), group_size, num_heads, head_dim).transpose(1, 2)
+            return qkv
+
+        query_states = shift(query_states, bsz, q_len, group_size, self.num_heads, self.head_dim)
+        key_states = shift(key_states, bsz, q_len, group_size, self.num_heads, self.head_dim)
+        value_states = shift(value_states, bsz, q_len, group_size, self.num_heads, self.head_dim)
+
+        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+
+        if attn_weights.size() != (bsz * num_group, self.num_heads, group_size, group_size):
+            raise ValueError(
+                f"Attention weights should be of size {(bsz * num_group, self.num_heads, group_size, group_size)}, but is"
+                f" {attn_weights.size()}"
+            )
+
+        attention_mask = attention_mask[:, :, :group_size, :group_size].repeat(num_group, 1, 1, 1)
+        if attention_mask is not None:
+            if attention_mask.size() != (bsz * num_group, 1, group_size, group_size):
+                raise ValueError(
+                    f"Attention mask should be of size {(bsz * num_group, 1, group_size, group_size)}, but is {attention_mask.size()}"
+                )
+            attn_weights = attn_weights + attention_mask
+
+        # upcast attention to fp32
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_output = torch.matmul(attn_weights, value_states)
+
+        if attn_output.size() != (bsz * num_group, self.num_heads, group_size, self.head_dim):
+            raise ValueError(
+                f"`attn_output` should be of size {(bsz * num_group, self.num_heads, group_size, self.head_dim)}, but is"
+                f" {attn_output.size()}"
+            )
+        attn_output = attn_output.transpose(1, 2).contiguous()
+
+        attn_output = attn_output.reshape(bsz, q_len, self.num_heads, self.head_dim)
+
+        # shift back
+        attn_output[:, :, self.num_heads//2:] = attn_output[:, :, self.num_heads//2:].roll(group_size//2, dims=1)
+
+        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+
+        if self.config.pretraining_tp > 1:
+            attn_output = attn_output.split(self.hidden_size // self.config.pretraining_tp, dim=2)
+            o_proj_slices = self.o_proj.weight.split(self.hidden_size // self.config.pretraining_tp, dim=1)
+            attn_output = sum([F.linear(attn_output[i], o_proj_slices[i]) for i in range(self.config.pretraining_tp)])
+        else:
+            attn_output = self.o_proj(attn_output)
+
+        if not output_attentions:
+            attn_weights = None
+
+        return attn_output, attn_weights, past_key_value
 
 # Disable the transformation of the attention mask in LlamaModel as the flash attention
 # requires the attention mask to be the same as the key_padding_mask
